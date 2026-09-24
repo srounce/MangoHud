@@ -139,19 +139,10 @@ void ensure_mangohud_config()
    });
 }
 
-bool init_session_overlay(xr_session_data *sd)
+bool init_session_overlay(xr_session_data *sd, const overlay_params& params)
 {
    xr_instance_data *inst = sd->instance;
 
-   /* Do not block the app's frame thread: if the Vulkan layer has not parsed
-    * the config yet, skip this frame and try again on the next one. */
-   auto params = get_params_nonblocking();
-   if (!params) {
-      SPDLOG_DEBUG("OpenXR: config not ready yet, deferring HUD setup a frame");
-      return false;
-   }
-
-   SPDLOG_DEBUG("OpenXR: enumerating swapchain formats");
    uint32_t n_formats = 0;
    if (!xr_ok(inst->EnumerateSwapchainFormats(sd->session, 0, &n_formats, nullptr), "xrEnumerateSwapchainFormats"))
       return false;
@@ -177,7 +168,7 @@ bool init_session_overlay(xr_session_data *sd)
       return false;
    }
 
-   sd->width = sd->height = std::max(params->vr_resolution, 64u);
+   sd->width = sd->height = std::max(params.vr_resolution, 64u);
    XrSwapchainCreateInfo swapchain_info { XR_TYPE_SWAPCHAIN_CREATE_INFO };
    swapchain_info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
    swapchain_info.format = sd->format;
@@ -203,12 +194,12 @@ bool init_session_overlay(xr_session_data *sd)
     * "local" and "stage" pin it in world space relative to the seated or
     * play-space origin, so it stays put and the user can look around it. */
    XrReferenceSpaceType ref_type = XR_REFERENCE_SPACE_TYPE_VIEW;
-   if (params->vr_anchor == "local")
+   if (params.vr_anchor == "local")
       ref_type = XR_REFERENCE_SPACE_TYPE_LOCAL;
-   else if (params->vr_anchor == "stage")
+   else if (params.vr_anchor == "stage")
       ref_type = XR_REFERENCE_SPACE_TYPE_STAGE;
-   else if (params->vr_anchor != "view")
-      SPDLOG_WARN("Unknown vr_anchor '{}', head-locking the HUD", params->vr_anchor);
+   else if (params.vr_anchor != "view")
+      SPDLOG_WARN("Unknown vr_anchor '{}', head-locking the HUD", params.vr_anchor);
 
    XrReferenceSpaceCreateInfo space_info { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
    space_info.referenceSpaceType = ref_type;
@@ -258,7 +249,8 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFra
    if (!sd->target) {
       /* Make sure the config and stats exist in this library, then set up. */
       ensure_mangohud_config();
-      if (!get_params_nonblocking()) {
+      auto params = get_params_nonblocking();
+      if (!params) {
          if (!sd->defer_logged) {
             SPDLOG_WARN("OpenXR: MangoHud config unavailable even after init; deferring HUD");
             sd->defer_logged = true;
@@ -267,7 +259,7 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFra
       }
 
       SPDLOG_DEBUG("First xrEndFrame for this session, setting up the headset HUD");
-      if (!init_session_overlay(sd)) {
+      if (!init_session_overlay(sd, *params)) {
          SPDLOG_ERROR("Giving up on drawing the HUD in the headset for this session");
          destroy_session_overlay(sd);
          sd->init_failed = true;
