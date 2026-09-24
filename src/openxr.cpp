@@ -20,6 +20,7 @@
 #include "mesa/util/macros.h"
 #include "overlay.h"
 #include "blacklist.h"
+#include "fps_limiter.h"
 #include "vulkan_xr.h"
 
 extern "C" PUBLIC XRAPI_ATTR XrResult XRAPI_CALL
@@ -63,7 +64,6 @@ struct xr_session_data {
    uint32_t width = 0, height = 0;
    xr_vk_target *target = nullptr;
    bool announced = false;
-   bool defer_logged = false;
 };
 
 std::mutex xr_lock;
@@ -90,6 +90,30 @@ bool xr_ok(XrResult result, const char *what)
       return true;
    SPDLOG_ERROR("{} failed with XrResult {}", what, (int)result);
    return false;
+}
+
+/* The OpenXR loader only checks that the enable variable is set, while the
+ * Vulkan manifest matches its value ("1"). Match the value here too, so
+ * MANGOHUD=0 disables both layers instead of just the Vulkan one. */
+bool mangohud_enabled()
+{
+   static const bool enabled = [] {
+      const char *e = getenv("MANGOHUD");
+      return e && strcmp(e, "1") == 0;
+   }();
+   return enabled;
+}
+
+/* fps_limit is normally applied around the mirror present, which is passed
+ * through while the headset loop runs; apply it here instead. */
+XrResult end_frame_limited(xr_instance_data *inst, XrSession session, const XrFrameEndInfo *info)
+{
+   if (fps_limiter)
+      fps_limiter->limit(true);
+   XrResult result = inst->EndFrame(session, info);
+   if (fps_limiter)
+      fps_limiter->limit(false);
+   return result;
 }
 
 template<typename T>
@@ -120,25 +144,6 @@ void destroy_session_overlay(xr_session_data *sd)
    }
 }
 
-/* The OpenXR layer and the Vulkan overlay may be different copies of
- * libMangoHud.so (e.g. a distro Vulkan layer beside a locally built OpenXR
- * layer), each with its own globals. The Vulkan layer parses the config and
- * sets up stats in its copy; if that has not happened in ours, do it here so
- * the OpenXR layer is self-sufficient. Runs once per process. */
-void ensure_mangohud_config()
-{
-   static std::once_flag once;
-   std::call_once(once, [] {
-      if (get_params_nonblocking())
-         return; /* the Vulkan overlay in this same library already did it */
-      SPDLOG_DEBUG("OpenXR: no Vulkan overlay in this library, initialising MangoHud here");
-      static overlay_params params;
-      parse_overlay_config(&params, getenv("MANGOHUD_CONFIG"), false);
-      init_system_info();
-      init_cpu_stats(params);
-   });
-}
-
 bool init_session_overlay(xr_session_data *sd, const overlay_params& params)
 {
    xr_instance_data *inst = sd->instance;
@@ -150,11 +155,11 @@ bool init_session_overlay(xr_session_data *sd, const overlay_params& params)
    if (!xr_ok(inst->EnumerateSwapchainFormats(sd->session, n_formats, &n_formats, formats.data()), "xrEnumerateSwapchainFormats"))
       return false;
 
-   /* sRGB first: the compositor blends in linear light and the HUD colors are
-    * sRGB encoded, which the Vulkan side accounts for per format. */
+   /* sRGB only: the compositor treats any non-sRGB format as linear, which
+    * would composite the sRGB-encoded HUD colors washed out. The Vulkan side
+    * linearises the colors for these formats. */
    static const VkFormat preferred[] = {
       VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB,
-      VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
    };
    sd->format = VK_FORMAT_UNDEFINED;
    for (VkFormat f : preferred) {
@@ -164,7 +169,7 @@ bool init_session_overlay(xr_session_data *sd, const overlay_params& params)
       }
    }
    if (sd->format == VK_FORMAT_UNDEFINED) {
-      SPDLOG_ERROR("OpenXR runtime offers no 8-bit RGBA swapchain format for the HUD");
+      SPDLOG_ERROR("OpenXR runtime offers no sRGB RGBA8 swapchain format for the HUD");
       return false;
    }
 
@@ -251,16 +256,12 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFra
       return inst->EndFrame(session, frameEndInfo);
 
    if (!sd->target) {
-      /* Make sure the config and stats exist in this library, then set up. */
-      ensure_mangohud_config();
+      /* The Vulkan layer in this library parsed the config when it created the
+       * device this session is bound to (checked at xrCreateSession), so this
+       * is only a guard. */
       auto params = get_params_nonblocking();
-      if (!params) {
-         if (!sd->defer_logged) {
-            SPDLOG_WARN("OpenXR: MangoHud config unavailable even after init; deferring HUD");
-            sd->defer_logged = true;
-         }
+      if (!params)
          return inst->EndFrame(session, frameEndInfo);
-      }
 
       SPDLOG_DEBUG("First xrEndFrame for this session, setting up the headset HUD");
       if (!init_session_overlay(sd, *params)) {
@@ -272,41 +273,44 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFra
    }
 
    if (!xr_vk_target_update(sd->target))
-      return inst->EndFrame(session, frameEndInfo);
+      return end_frame_limited(inst, session, frameEndInfo);
 
    uint32_t image_index = 0;
    XrSwapchainImageAcquireInfo acquire_info { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
    if (!xr_ok(inst->AcquireSwapchainImage(sd->swapchain, &acquire_info, &image_index), "xrAcquireSwapchainImage"))
-      return inst->EndFrame(session, frameEndInfo);
+      return end_frame_limited(inst, session, frameEndInfo);
 
    XrSwapchainImageWaitInfo wait_info { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
    wait_info.timeout = XR_INFINITE_DURATION;
-   bool drawn = xr_ok(inst->WaitSwapchainImage(sd->swapchain, &wait_info), "xrWaitSwapchainImage");
-   if (drawn)
-      xr_vk_target_draw(sd->target, image_index);
+   /* Only true when the HUD was actually recorded into the image; the draw can
+    * still decline, e.g. no_display flipped by a config reload mid-frame. */
+   bool drawn = xr_ok(inst->WaitSwapchainImage(sd->swapchain, &wait_info), "xrWaitSwapchainImage")
+             && xr_vk_target_draw(sd->target, image_index);
 
    /* Release balances the acquire even on wait failure, or the image stays
     * acquired forever. */
    XrSwapchainImageReleaseInfo release_info { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
    xr_ok(inst->ReleaseSwapchainImage(sd->swapchain, &release_info), "xrReleaseSwapchainImage");
 
-   /* Without a wait the image holds no HUD, so submit the runtime's own layers
-    * untouched rather than a quad over garbage. */
+   /* Without a draw the image holds no fresh HUD, so submit the runtime's own
+    * layers untouched rather than a quad over stale or uncleared contents. */
    if (!drawn)
-      return inst->EndFrame(session, frameEndInfo);
+      return end_frame_limited(inst, session, frameEndInfo);
 
    auto params = get_params_nonblocking();
    if (!params)
-      return inst->EndFrame(session, frameEndInfo);
+      return end_frame_limited(inst, session, frameEndInfo);
    XrCompositionLayerQuad quad { XR_TYPE_COMPOSITION_LAYER_QUAD };
    quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
    quad.space = sd->space;
    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
    quad.subImage.swapchain = sd->swapchain;
-   /* Show only the region the HUD covered, sized so its aspect is preserved. */
+   /* Show only the HUD window itself, wherever `position` put it on the
+    * canvas, sized so its aspect is preserved. */
+   int32_t content_x = 0, content_y = 0;
    uint32_t content_w = sd->width, content_h = sd->height;
-   xr_vk_target_content_extent(sd->target, content_w, content_h);
-   quad.subImage.imageRect.offset = { 0, 0 };
+   xr_vk_target_content_rect(sd->target, content_x, content_y, content_w, content_h);
+   quad.subImage.imageRect.offset = { content_x, content_y };
    quad.subImage.imageRect.extent = { (int32_t)content_w, (int32_t)content_h };
    quad.subImage.imageArrayIndex = 0;
    quad.pose.orientation = { 0.f, 0.f, 0.f, 1.f };
@@ -317,15 +321,15 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFra
                                                             frameEndInfo->layers + frameEndInfo->layerCount);
    layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad));
    if (!sd->announced) {
-      SPDLOG_DEBUG("OpenXR HUD quad submitted: {:.2f}x{:.2f} m at {:.2f} m in view space",
-                   quad.size.width, quad.size.height, params->vr_distance);
+      SPDLOG_DEBUG("OpenXR HUD quad submitted: {:.2f}x{:.2f} m at {:.2f} m, anchor {}",
+                   quad.size.width, quad.size.height, params->vr_distance, params->vr_anchor);
       sd->announced = true;
    }
 
    XrFrameEndInfo end_info = *frameEndInfo;
    end_info.layerCount = (uint32_t)layers.size();
    end_info.layers = layers.data();
-   return inst->EndFrame(session, &end_info);
+   return end_frame_limited(inst, session, &end_info);
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL overlay_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInfo, XrSession *session)
@@ -347,11 +351,20 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrCreateSession(XrInstance instance, cons
          sd->vulkan = true;
       }
    }
-   if (sd->vulkan)
-      SPDLOG_DEBUG("OpenXR Vulkan session created: VkDevice {} queue family {} index {}",
-                  (void *)sd->binding.device, sd->binding.queueFamilyIndex, sd->binding.queueIndex);
-   else
+   if (!sd->vulkan) {
       SPDLOG_INFO("OpenXR session is not Vulkan, the HUD will not be drawn in the headset");
+   } else if (!xr_vk_device_known(sd->binding.device)) {
+      /* Rendering reuses the Vulkan layer's device tables, which only exist in
+       * the copy of libMangoHud.so that intercepted vkCreateDevice. Decide it
+       * here so no swapchain, space or stats are set up for nothing. */
+      SPDLOG_WARN("OpenXR session's VkDevice was not seen by the Vulkan layer in this library "
+                  "(MangoHud blacklisted for this app, or the Vulkan and OpenXR manifests point at "
+                  "different libMangoHud.so files); not drawing the HUD in the headset");
+      sd->vulkan = false;
+   } else {
+      SPDLOG_DEBUG("OpenXR Vulkan session created: VkDevice {} queue family {} index {}",
+                   (void *)sd->binding.device, sd->binding.queueFamilyIndex, sd->binding.queueIndex);
+   }
 
    std::lock_guard<std::mutex> lk(xr_lock);
    xr_sessions[*session] = sd;
@@ -473,7 +486,7 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrGetInstanceProcAddr(XrInstance instance
    *function = nullptr;
 
    for (const auto& hook : hooks) {
-      if ((hook.always || !is_blacklisted()) && strcmp(name, hook.name) == 0) {
+      if ((hook.always || (mangohud_enabled() && !is_blacklisted())) && strcmp(name, hook.name) == 0) {
          *function = hook.fn;
          return XR_SUCCESS;
       }

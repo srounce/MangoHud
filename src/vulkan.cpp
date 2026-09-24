@@ -43,6 +43,7 @@
 
 #include "mesa/util/macros.h" // defines "restrict" for vk_util.h
 #include "mesa/util/os_socket.h"
+#include "mesa/util/os_time.h"
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_enum_string_helper.h>
 #include <vulkan/vk_layer.h>
@@ -138,6 +139,9 @@ struct overlay_draw {
 
    VkSemaphore semaphore;
    VkFence fence;
+   /* A submission signalling `fence` is in flight; only then is waiting on it
+    * meaningful, since a failed vkQueueSubmit leaves it unsignalled forever. */
+   bool pending;
 
    VkBuffer vertex_buffer;
    VkDeviceMemory vertex_buffer_mem;
@@ -192,6 +196,11 @@ struct swapchain_data {
    bool xr;
    struct queue_data *xr_queue;
 
+   /* Transfer function the HUD colors must be encoded for on this target.
+    * HUDElements.colors is shared, so it is re-applied whenever a target with
+    * a different one renders. */
+   int transfer_function;
+
    struct swapchain_stats sw_stats;
 };
 
@@ -200,9 +209,25 @@ std::mutex global_lock;
 typedef std::lock_guard<std::mutex> scoped_lock;
 std::unordered_map<uint64_t, void *> vk_object_to_data;
 
-/* Live OpenXR HUD targets. While one exists the headset frame loop owns frame
- * timing and the mirror window's presents are passed through untouched. */
-static std::atomic<unsigned> xr_target_count {0};
+/* Serialises overlay rendering and target setup/teardown across the mirror
+ * present path and the OpenXR frame path. They share HUDElements, the ImGui
+ * globals and device_data->graphic_queue, so a check on a counter is not
+ * enough: an in-flight mirror frame must finish before a headset target is
+ * built, and the two must never draw at once. */
+static std::mutex overlay_lock;
+
+/* Last time the OpenXR frame loop ran an update. While it is recent the
+ * headset loop owns frame timing and keybinds and the mirror present path
+ * passes through; once frames stop (session idle, headset off) the mirror
+ * resumes so stats and keybinds keep working. */
+static std::atomic<uint64_t> xr_last_frame_ns {0};
+static const uint64_t XR_IDLE_NS = 500ull * 1000 * 1000;
+
+static bool xr_hud_active()
+{
+   uint64_t last = xr_last_frame_ns.load(std::memory_order_relaxed);
+   return last != 0 && os_time_get_nano() - last < XR_IDLE_NS;
+}
 
 thread_local ImGuiContext* __MesaImGui;
 
@@ -478,10 +503,13 @@ static struct overlay_draw *get_overlay_draw(struct swapchain_data *data, unsign
    sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
    if (draw) {
-      VK_CHECK(device_data->vtable.WaitForFences(device_data->device, 1,
-                                                 &draw->fence, VK_TRUE, ~0ull));
-      VK_CHECK(device_data->vtable.ResetFences(device_data->device,
-                                               1, &draw->fence));
+      if (draw->pending) {
+         VK_CHECK(device_data->vtable.WaitForFences(device_data->device, 1,
+                                                    &draw->fence, VK_TRUE, ~0ull));
+         VK_CHECK(device_data->vtable.ResetFences(device_data->device,
+                                                  1, &draw->fence));
+         draw->pending = false;
+      }
       return draw;
    }
 
@@ -541,8 +569,14 @@ static void compute_swapchain_display(struct swapchain_data *data)
    auto saved_imgui_context = get_current_imgui_contexts();
    make_imgui_contexts_current(data->imgui_contexts);
 
-   if (HUDElements.colors.update)
-      HUDElements.convert_colors(instance_data->params);
+   /* HUDElements.colors is shared but converted for one transfer function at
+    * a time; re-apply this target's when another (e.g. an sRGB headset quad
+    * beside a UNORM mirror) rendered last, or when the config changed. */
+   if (HUDElements.colors.update ||
+       instance_data->params.transfer_function != data->transfer_function) {
+      instance_data->params.transfer_function = data->transfer_function;
+      HUDElements.convert_colors(data->transfer_function != NONE, instance_data->params);
+   }
 
    ImGui::NewFrame();
    {
@@ -1095,7 +1129,10 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
       submit_info.commandBufferCount = 1;
       submit_info.pCommandBuffers = &draw->command_buffer;
 
-      device_data->vtable.QueueSubmit(present_queue->queue, 1, &submit_info, draw->fence);
+      VkResult res = device_data->vtable.QueueSubmit(present_queue->queue, 1, &submit_info, draw->fence);
+      draw->pending = res == VK_SUCCESS;
+      if (res != VK_SUCCESS)
+         SPDLOG_ERROR("OpenXR HUD vkQueueSubmit failed with {}", vk_Result_to_str(res));
    } else if (n_wait_semaphores == 0 && device_data->graphic_queue->queue != present_queue->queue) {
       VkPipelineStageFlags stages_wait = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
       VkSubmitInfo submit_info = {};
@@ -1118,6 +1155,7 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
       submit_info.pSignalSemaphores = &draw->semaphore;
 
       device_data->vtable.QueueSubmit(device_data->graphic_queue->queue, 1, &submit_info, draw->fence);
+      draw->pending = true;
    } else {
       // wait in the fragment stage until the swapchain image is ready
       std::vector<VkPipelineStageFlags> stages_wait(n_wait_semaphores, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
@@ -1133,6 +1171,7 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
       submit_info.pSignalSemaphores = &draw->semaphore;
 
       device_data->vtable.QueueSubmit(device_data->graphic_queue->queue, 1, &submit_info, draw->fence);
+      draw->pending = true;
    }
 
    make_imgui_contexts_current(saved_imgui_context);
@@ -1346,7 +1385,7 @@ static void setup_swapchain_data_pipeline(struct swapchain_data *data)
 //      update_image_descriptor(data, data->font_image_view[0], data->descriptor_set);
 }
 
-static void convert_colors_vk(VkFormat format, VkColorSpaceKHR colorspace, struct swapchain_stats& sw_stats, struct overlay_params& params)
+static int convert_colors_vk(VkFormat format, VkColorSpaceKHR colorspace, struct swapchain_stats& sw_stats, struct overlay_params& params)
 {
    /* TODO: Support more colorspacess */
    switch (colorspace) {
@@ -1408,6 +1447,7 @@ static void convert_colors_vk(VkFormat format, VkColorSpaceKHR colorspace, struc
    }
 
    HUDElements.convert_colors(params.transfer_function != NONE, params);
+   return params.transfer_function;
 }
 
 static void setup_swapchain_data(struct swapchain_data *data,
@@ -1426,7 +1466,7 @@ static void setup_swapchain_data(struct swapchain_data *data,
 
    ImGui::GetIO().IniFilename = NULL;
    ImGui::GetIO().DisplaySize = ImVec2((float)data->width, (float)data->height);
-   convert_colors_vk(format, colorspace, data->sw_stats, device_data->instance->params);
+   data->transfer_function = convert_colors_vk(format, colorspace, data->sw_stats, device_data->instance->params);
 
    /* Render pass */
    VkAttachmentDescription attachment_desc = {};
@@ -1719,9 +1759,14 @@ static VkResult overlay_CreateSwapchainKHR(
    VkResult result = device_data->vtable.CreateSwapchainKHR(device, &createInfo, pAllocator, pSwapchain);
    if (result != VK_SUCCESS) return result;
    struct swapchain_data *swapchain_data = new_swapchain_data(*pSwapchain, device_data);
-   setup_swapchain_data(swapchain_data, pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
-                        pCreateInfo->imageFormat, pCreateInfo->imageColorSpace);
-   fill_swapchain_stats(swapchain_data);
+   {
+      /* Building an imgui context and re-deriving colors must not overlap
+       * the headset frame path. */
+      std::lock_guard<std::mutex> lk(overlay_lock);
+      setup_swapchain_data(swapchain_data, pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
+                           pCreateInfo->imageFormat, pCreateInfo->imageColorSpace);
+      fill_swapchain_stats(swapchain_data);
+   }
 
    return result;
 }
@@ -1740,7 +1785,10 @@ static void overlay_DestroySwapchainKHR(
    struct swapchain_data *swapchain_data =
       FIND(struct swapchain_data, swapchain);
 
-   shutdown_swapchain_data(swapchain_data);
+   {
+      std::lock_guard<std::mutex> lk(overlay_lock);
+      shutdown_swapchain_data(swapchain_data);
+   }
    swapchain_data->device->vtable.DestroySwapchainKHR(device, swapchain, pAllocator);
    destroy_swapchain_data(swapchain_data);
 }
@@ -1751,12 +1799,17 @@ static VkResult overlay_QueuePresentKHR(
 {
    struct queue_data *queue_data = FIND(struct queue_data, queue);
 
-   /* With an OpenXR session drawing the HUD, presents only feed the mirror
+   /* While the OpenXR frame loop is running, presents only feed the mirror
     * window: neither their pacing nor their rate says anything about the
-    * headset.
+    * headset, and that loop already services stats, keybinds and the fps
+    * limiter. Once it goes quiet (session idle, headset off) the mirror takes
+    * over again.
     */
-   if (xr_target_count.load(std::memory_order_relaxed) > 0)
+   std::unique_lock<std::mutex> overlay_lk(overlay_lock);
+   if (xr_hud_active()) {
+      overlay_lk.unlock();
       return queue_data->device->vtable.QueuePresentKHR(queue, pPresentInfo);
+   }
 
    if (fps_limiter)
       fps_limiter->limit(true);
@@ -1804,6 +1857,9 @@ static VkResult overlay_QueuePresentKHR(
       }
    }
 
+   /* Rendering is recorded; do not hold the lock across a present that may
+    * block on vsync. */
+   overlay_lk.unlock();
    VkResult result = queue_data->device->vtable.QueuePresentKHR(queue, &present_info);
 
    if (fps_limiter)
@@ -2314,6 +2370,12 @@ struct xr_vk_target {
    struct swapchain_data *swapchain;
 };
 
+bool xr_vk_device_known(VkDevice device)
+{
+   struct device_data *device_data = FIND(struct device_data, device);
+   return device_data && device_data->graphic_queue;
+}
+
 xr_vk_target *xr_vk_target_create(const xr_vk_target_info& info)
 {
    struct device_data *device_data = FIND(struct device_data, info.device);
@@ -2338,8 +2400,6 @@ xr_vk_target *xr_vk_target_create(const xr_vk_target_info& info)
       return nullptr;
    }
 
-   /* Fetch everything that can fail before gating the mirror present path off,
-    * so a failure here leaves the count untouched. */
    struct queue_data *queue_data = FIND(struct queue_data, queue);
    std::vector<VkQueueFamilyProperties> family_props;
    if (!queue_data) {
@@ -2355,11 +2415,10 @@ xr_vk_target *xr_vk_target_create(const xr_vk_target_info& info)
       }
    }
 
-   /* From here on the mirror present path must not run concurrently: reassigning
-    * graphic_queue and building the imgui context below both touch state it
-    * reads. Gate it off before that, and keep it off until this target is torn
-    * down (xr_vk_target_destroy). */
-   xr_target_count++;
+   /* Everything below touches state the mirror present path reads
+    * (graphic_queue, the ImGui globals); the lock waits out any frame it is
+    * in the middle of and keeps it out until we are done. */
+   std::lock_guard<std::mutex> lk(overlay_lock);
 
    if (!queue_data) {
       VK_CHECK(device_data->set_device_loader_data(device_data->device, queue));
@@ -2387,6 +2446,12 @@ xr_vk_target *xr_vk_target_create(const xr_vk_target_info& info)
 bool xr_vk_target_update(xr_vk_target *target)
 {
    struct swapchain_data *data = target->swapchain;
+   std::lock_guard<std::mutex> lk(overlay_lock);
+
+   /* Marks the headset loop as live so the mirror path yields stats, keybinds
+    * and the fps limiter to it; runs even when the HUD is hidden, since the
+    * keybind to unhide it is serviced from here. */
+   xr_last_frame_ns.store(os_time_get_nano(), std::memory_order_relaxed);
 
    snapshot_swapchain_frame(data);
    if (data->sw_stats.n_frames == 0 || get_params()->no_display)
@@ -2401,21 +2466,27 @@ bool xr_vk_target_update(xr_vk_target *target)
    return has_draws;
 }
 
-void xr_vk_target_draw(xr_vk_target *target, uint32_t image_index)
+bool xr_vk_target_draw(xr_vk_target *target, uint32_t image_index)
 {
    struct swapchain_data *data = target->swapchain;
-   render_swapchain_display(data, data->xr_queue, nullptr, 0, image_index);
+   std::lock_guard<std::mutex> lk(overlay_lock);
+   return render_swapchain_display(data, data->xr_queue, nullptr, 0, image_index) != nullptr;
 }
 
-void xr_vk_target_content_extent(xr_vk_target *target, uint32_t& width, uint32_t& height)
+void xr_vk_target_content_rect(xr_vk_target *target, int32_t& x, int32_t& y, uint32_t& width, uint32_t& height)
 {
    struct swapchain_data *data = target->swapchain;
-   /* main_window_pos is the HUD's top-left; mirror that gap on the far side so
-    * the content sits centered in the cropped region. */
-   float w = data->sw_stats.main_window_pos.x * 2.0f + data->window_size.x;
-   float h = data->sw_stats.main_window_pos.y * 2.0f + data->window_size.y;
-   width = std::min(data->width, (uint32_t)std::max(w + 0.5f, 1.0f));
-   height = std::min(data->height, (uint32_t)std::max(h + 0.5f, 1.0f));
+   /* The HUD window sits at main_window_pos with size window_size wherever
+    * `position` placed it on the canvas; crop to exactly that so the quad
+    * shows the HUD and nothing else, whatever the position setting. */
+   float x0 = std::clamp(data->sw_stats.main_window_pos.x, 0.f, (float)data->width - 1.f);
+   float y0 = std::clamp(data->sw_stats.main_window_pos.y, 0.f, (float)data->height - 1.f);
+   float x1 = std::clamp(x0 + data->window_size.x, x0 + 1.f, (float)data->width);
+   float y1 = std::clamp(y0 + data->window_size.y, y0 + 1.f, (float)data->height);
+   x = (int32_t)x0;
+   y = (int32_t)y0;
+   width = (uint32_t)(x1 - x0 + 0.5f);
+   height = (uint32_t)(y1 - y0 + 0.5f);
 }
 
 void xr_vk_target_destroy(xr_vk_target *target)
@@ -2423,14 +2494,23 @@ void xr_vk_target_destroy(xr_vk_target *target)
    struct swapchain_data *data = target->swapchain;
    struct device_data *device_data = data->device;
 
+   std::lock_guard<std::mutex> lk(overlay_lock);
+
+   /* Only a fence with a submission behind it can ever signal, and a wedged
+    * GPU must not hang session teardown, so bound the wait. */
    for (auto draw : data->draws) {
-      if (draw)
-         VK_CHECK(device_data->vtable.WaitForFences(device_data->device, 1, &draw->fence, VK_TRUE, ~0ull));
+      if (!draw || !draw->pending)
+         continue;
+      VkResult res = device_data->vtable.WaitForFences(device_data->device, 1, &draw->fence, VK_TRUE,
+                                                       2000ull * 1000 * 1000);
+      if (res != VK_SUCCESS)
+         SPDLOG_WARN("OpenXR HUD draw still in flight at teardown: {}", vk_Result_to_str(res));
+      draw->pending = false;
    }
    shutdown_swapchain_data(data);
    destroy_swapchain_data(data);
-   /* The mirror present path may touch graphic_queue and the shared imgui
-    * context again only now that both are gone. */
-   xr_target_count--;
    delete target;
+
+   /* Let the mirror path resume immediately rather than after the idle timeout. */
+   xr_last_frame_ns.store(0, std::memory_order_relaxed);
 }

@@ -303,9 +303,9 @@ Using normal mangohud with gamescope is not supported.
 
 ## OpenXR / VR
 
-MangoHud also installs an implicit OpenXR API layer (built when the OpenXR headers are found, see `with_openxr`). With `MANGOHUD=1` set, or when launched through `mangohud`, any Vulkan OpenXR session gets the HUD composited into the headset as a head-locked quad, and frame timing is measured at `xrEndFrame` instead of at the mirror window. The mirror window is left untouched while such a session is alive. Proton titles reach OpenXR through OpenComposite or xrizer, so they work too, but games talking native OpenVR to SteamVR do not.
+MangoHud also installs an implicit OpenXR API layer (built when the OpenXR headers are found, see `with_openxr`). With `MANGOHUD=1` set, or when launched through `mangohud`, any Vulkan OpenXR session gets the HUD composited into the headset as a quad, and frame timing, keybinds and `fps_limit` are driven from `xrEndFrame` instead of the mirror window. While the headset frame loop is running the mirror window is left untouched; when it stops (headset off, session idle) the mirror overlay resumes. Proton titles reach OpenXR through OpenComposite or xrizer, so they work too, but games talking native OpenVR to SteamVR do not.
 
-The layer manifest is installed to `share/openxr/1/api_layers/implicit.d/`. The OpenXR loader looks for that path under `$XDG_CONFIG_DIRS`, `/etc`, `$XDG_DATA_DIRS` and `$XDG_DATA_HOME` (`~/.local/share`), so a prefix outside those needs the manifest copied or symlinked into one of them. Placement is controlled by `vr_distance`, `vr_size`, `vr_offset_x`, `vr_offset_y` and `vr_resolution`.
+The layer renders through the Vulkan layer's device tables, so both manifests must point at the same `libMangoHud.so`; a normal install does this. The OpenXR manifest is installed to `share/openxr/1/api_layers/implicit.d/`, and the loader looks for that path under `$XDG_CONFIG_DIRS`, `/etc`, `$XDG_DATA_DIRS` and `$XDG_DATA_HOME` (`~/.local/share`), so a prefix outside those needs the manifest copied or symlinked into one of them. Placement is controlled by `vr_anchor`, `vr_distance`, `vr_size`, `vr_offset_x`, `vr_offset_y` and `vr_resolution`.
 
 ## Hud configuration
 
