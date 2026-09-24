@@ -58,7 +58,7 @@ struct xr_session_data {
 
    bool init_failed = false;
    XrSwapchain swapchain = XR_NULL_HANDLE;
-   XrSpace view_space = XR_NULL_HANDLE;
+   XrSpace space = XR_NULL_HANDLE;
    VkFormat format = VK_FORMAT_UNDEFINED;
    uint32_t width = 0, height = 0;
    xr_vk_target *target = nullptr;
@@ -114,9 +114,9 @@ void destroy_session_overlay(xr_session_data *sd)
       inst->DestroySwapchain(sd->swapchain);
       sd->swapchain = XR_NULL_HANDLE;
    }
-   if (sd->view_space != XR_NULL_HANDLE) {
-      inst->DestroySpace(sd->view_space);
-      sd->view_space = XR_NULL_HANDLE;
+   if (sd->space != XR_NULL_HANDLE) {
+      inst->DestroySpace(sd->space);
+      sd->space = XR_NULL_HANDLE;
    }
 }
 
@@ -199,11 +199,29 @@ bool init_session_overlay(xr_session_data *sd)
               "xrEnumerateSwapchainImages"))
       return false;
 
+   /* Anchor: "view" head-locks the HUD to the eyes (it follows the gaze);
+    * "local" and "stage" pin it in world space relative to the seated or
+    * play-space origin, so it stays put and the user can look around it. */
+   XrReferenceSpaceType ref_type = XR_REFERENCE_SPACE_TYPE_VIEW;
+   if (params->vr_anchor == "local")
+      ref_type = XR_REFERENCE_SPACE_TYPE_LOCAL;
+   else if (params->vr_anchor == "stage")
+      ref_type = XR_REFERENCE_SPACE_TYPE_STAGE;
+   else if (params->vr_anchor != "view")
+      SPDLOG_WARN("Unknown vr_anchor '{}', head-locking the HUD", params->vr_anchor);
+
    XrReferenceSpaceCreateInfo space_info { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
-   space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+   space_info.referenceSpaceType = ref_type;
    space_info.poseInReferenceSpace.orientation = { 0.f, 0.f, 0.f, 1.f };
    space_info.poseInReferenceSpace.position = { 0.f, 0.f, 0.f };
-   if (!xr_ok(inst->CreateReferenceSpace(sd->session, &space_info, &sd->view_space), "xrCreateReferenceSpace"))
+   XrResult space_result = inst->CreateReferenceSpace(sd->session, &space_info, &sd->space);
+   if (XR_FAILED(space_result) && ref_type == XR_REFERENCE_SPACE_TYPE_STAGE) {
+      /* Not every runtime or setup has a configured play space. */
+      SPDLOG_WARN("vr_anchor=stage unavailable, falling back to local");
+      space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+      space_result = inst->CreateReferenceSpace(sd->session, &space_info, &sd->space);
+   }
+   if (!xr_ok(space_result, "xrCreateReferenceSpace"))
       return false;
 
    xr_vk_target_info target_info {};
@@ -286,7 +304,7 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFra
       return inst->EndFrame(session, frameEndInfo);
    XrCompositionLayerQuad quad { XR_TYPE_COMPOSITION_LAYER_QUAD };
    quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-   quad.space = sd->view_space;
+   quad.space = sd->space;
    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
    quad.subImage.swapchain = sd->swapchain;
    quad.subImage.imageRect.offset = { 0, 0 };

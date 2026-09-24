@@ -230,6 +230,7 @@ struct Tracepoint;
    OVERLAY_PARAM_CUSTOM(vr_offset_x)                 \
    OVERLAY_PARAM_CUSTOM(vr_offset_y)                 \
    OVERLAY_PARAM_CUSTOM(vr_resolution)               \
+   OVERLAY_PARAM_CUSTOM(vr_anchor)                   \
 
 enum overlay_param_position {
    LAYER_POSITION_TOP_LEFT,
@@ -364,6 +365,7 @@ struct overlay_params {
    int picmip;
    float vr_distance, vr_size, vr_offset_x, vr_offset_y;
    unsigned vr_resolution;
+   std::string vr_anchor;
    int af;
    std::vector<int> preset;
    size_t font_params_hash;

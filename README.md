@@ -443,8 +443,9 @@ Parameters that are enabled by default have to be explicitly disabled. These (cu
 | `no_display`                       | Hide the HUD by default                                                               |
 | `no_small_font`                    | Use primary font size for smaller text like units                                     |
 | `offset_x` `offset_y`              | HUD position offsets                                                                  |
-| `vr_distance` `vr_size`            | OpenXR: distance of the head-locked HUD quad from the eyes and its width, both in metres. Default `1.0` and `0.8` |
-| `vr_offset_x` `vr_offset_y`        | OpenXR: move the HUD quad right/up, in metres                                         |
+| `vr_anchor`                        | OpenXR: where the HUD quad is anchored. `view` (default) head-locks it to the gaze; `local` pins it in front of the seated origin; `stage` pins it relative to the play-space origin, so it floats and you can look around it |
+| `vr_distance` `vr_size`            | OpenXR: distance of the HUD quad from the anchor and its width, both in metres. Default `1.0` and `0.8` |
+| `vr_offset_x` `vr_offset_y`        | OpenXR: move the HUD quad right/up from the anchor, in metres. With `vr_anchor=stage` the up offset is height from the floor, so an eye-level HUD needs roughly `vr_offset_y=1.5` |
 | `vr_resolution`                    | OpenXR: HUD quad texture size in pixels (square). Default `1024`                      |
 | `output_file`                      | Set location and name of the log file                                                 |
 | `output_folder`                    | Set location of the output files (Required for logging)                               |

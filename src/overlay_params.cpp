@@ -619,6 +619,7 @@ parse_ftrace(const char *str) {
 #define parse_vr_offset_x(s) parse_float(s)
 #define parse_vr_offset_y(s) parse_float(s)
 #define parse_vr_resolution(s) parse_unsigned(s)
+#define parse_vr_anchor(s) parse_str(s)
 
 #define parse_cpu_color(s) parse_color(s)
 #define parse_gpu_color(s) parse_color(s)
@@ -908,6 +909,7 @@ static void set_param_defaults(struct overlay_params *params){
    params->vr_offset_x = 0.0f;
    params->vr_offset_y = 0.0f;
    params->vr_resolution = 1024;
+   params->vr_anchor = "view";
    params->cpu_color = 0x2e97cb;
    params->vram_color = 0xad64c1;
    params->ram_color = 0xc26693;
