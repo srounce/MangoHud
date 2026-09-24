@@ -172,10 +172,18 @@ link_args = cc.get_supported_link_arguments(['-Wl,-Bsymbolic-functions', '-Wl,-z
 # meson fails to check version-script so just force add
 link_args += '-Wl,--version-script,@0@'.format(join_paths(meson.current_source_dir(), 'mangohud.version'))
 
+openxr_files = []
+openxr_deps = []
+if openxr_dep.found()
+  openxr_files = files('openxr.cpp')
+  openxr_deps = openxr_dep.partial_dependency(compile_args : true, includes : true)
+endif
+
 mangohud_static_lib = static_library(
   'MangoHud',
   mangohud_version,
   files('vulkan.cpp'),
+  openxr_files,
   util_files,
   vk_enum_to_str,
   vk_dispatch_table,
@@ -204,6 +212,7 @@ mangohud_static_lib = static_library(
     dep_vulkan_utility_libraries,
     windows_deps,
     implot_dep,
+    openxr_deps,
     mangohud_version_dep],
   include_directories : [inc_common],
   link_args : link_args,
@@ -332,6 +341,16 @@ configure_file(input : 'mangohud.json.in',
   install_dir : join_paths(get_option('datadir'), 'vulkan', 'implicit_layer.d'),
   install_tag : 'runtime',
 )
+
+if openxr_dep.found()
+  configure_file(input : 'mangohud_openxr.json.in',
+    output : '@0@.openxr.@1@.json'.format(meson.project_name(), host_machine.cpu_family()),
+    configuration : conf_data,
+    install : true,
+    install_dir : join_paths(get_option('datadir'), 'openxr', '1', 'api_layers', 'implicit.d'),
+    install_tag : 'runtime',
+  )
+endif
 
 configured_mangohud = configure_file(input : '../bin/mangohud.in',
   output : 'mangohud.vcs.in',

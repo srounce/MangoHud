@@ -301,6 +301,12 @@ To enable mangohud with gamescope you need to install mangoapp.
 
 Using normal mangohud with gamescope is not supported.
 
+## OpenXR / VR
+
+MangoHud also installs an implicit OpenXR API layer (built when the OpenXR headers are found, see `with_openxr`). With `MANGOHUD=1` set, or when launched through `mangohud`, any Vulkan OpenXR session gets the HUD composited into the headset as a head-locked quad, and frame timing is measured at `xrEndFrame` instead of at the mirror window. The mirror window is left untouched while such a session is alive. Proton titles reach OpenXR through OpenComposite or xrizer, so they work too, but games talking native OpenVR to SteamVR do not.
+
+The layer manifest is installed to `share/openxr/1/api_layers/implicit.d/`. The OpenXR loader looks for that path under `$XDG_CONFIG_DIRS`, `/etc`, `$XDG_DATA_DIRS` and `$XDG_DATA_HOME` (`~/.local/share`), so a prefix outside those needs the manifest copied or symlinked into one of them. Placement is controlled by `vr_distance`, `vr_size`, `vr_offset_x`, `vr_offset_y` and `vr_resolution`.
+
 ## Hud configuration
 
 MangoHud comes with a config file which can be used to set configuration options globally or per application. Usually it is installed as `/usr/share/doc/mangohud/MangoHud.conf.example` or [get a copy from here](https://raw.githubusercontent.com/flightlessmango/MangoHud/master/data/MangoHud.conf).
@@ -437,6 +443,9 @@ Parameters that are enabled by default have to be explicitly disabled. These (cu
 | `no_display`                       | Hide the HUD by default                                                               |
 | `no_small_font`                    | Use primary font size for smaller text like units                                     |
 | `offset_x` `offset_y`              | HUD position offsets                                                                  |
+| `vr_distance` `vr_size`            | OpenXR: distance of the head-locked HUD quad from the eyes and its width, both in metres. Default `1.0` and `0.8` |
+| `vr_offset_x` `vr_offset_y`        | OpenXR: move the HUD quad right/up, in metres                                         |
+| `vr_resolution`                    | OpenXR: HUD quad texture size in pixels (square). Default `1024`                      |
 | `output_file`                      | Set location and name of the log file                                                 |
 | `output_folder`                    | Set location of the output files (Required for logging)                               |
 | `pci_dev`                          | Select GPU device in multi-gpu setups                                                 |

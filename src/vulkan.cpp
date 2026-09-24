@@ -34,6 +34,7 @@
 #include <vector>
 #include <list>
 #include <array>
+#include <atomic>
 #include <iomanip>
 #include <sstream>
 #include <inttypes.h>
@@ -64,6 +65,7 @@
 #endif
 #include "imgui_utils.h"
 #include "fps_limiter.h"
+#include "vulkan_xr.h"
 
 using namespace std;
 
@@ -185,6 +187,11 @@ struct swapchain_data {
    ImFontAtlas* font_atlas;
    ImVec2 window_size;
 
+   /* Images belong to an OpenXR swapchain: cleared each frame, kept in
+    * COLOR_ATTACHMENT_OPTIMAL and submitted on the session's queue. */
+   bool xr;
+   struct queue_data *xr_queue;
+
    struct swapchain_stats sw_stats;
 };
 
@@ -192,6 +199,10 @@ struct swapchain_data {
 std::mutex global_lock;
 typedef std::lock_guard<std::mutex> scoped_lock;
 std::unordered_map<uint64_t, void *> vk_object_to_data;
+
+/* Live OpenXR HUD targets. While one exists the headset frame loop owns frame
+ * timing and the mirror window's presents are passed through untouched. */
+static std::atomic<unsigned> xr_target_count {0};
 
 thread_local ImGuiContext* __MesaImGui;
 
@@ -443,7 +454,8 @@ static struct swapchain_data *new_swapchain_data(VkSwapchainKHR swapchain,
    data->swapchain = swapchain;
    data->window_size = ImVec2(instance_data->params.width, instance_data->params.height);
    data->font_atlas = IM_NEW(ImFontAtlas);
-   map_object(HKEY(data->swapchain), data);
+   if (swapchain != VK_NULL_HANDLE)
+      map_object(HKEY(data->swapchain), data);
    return data;
 }
 
@@ -872,6 +884,9 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
    render_pass_info.framebuffer = data->framebuffers[image_index];
    render_pass_info.renderArea.extent.width = data->width;
    render_pass_info.renderArea.extent.height = data->height;
+   VkClearValue clear_value = {};
+   render_pass_info.clearValueCount = 1;
+   render_pass_info.pClearValues = &clear_value;
 
    VkCommandBufferBeginInfo buffer_begin_info = {};
    buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -881,7 +896,7 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
    ensure_swapchain_fonts(data, draw->command_buffer);
 
    /* Bounce the image to display back to color attachment layout for
-    * rendering on top of it.
+    * rendering on top of it. OpenXR hands its images over in that layout.
     */
    VkImageMemoryBarrier imb;
    imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -898,13 +913,15 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
    imb.subresourceRange.layerCount = 1;
    imb.srcQueueFamilyIndex = present_queue->family_index;
    imb.dstQueueFamilyIndex = device_data->graphic_queue->family_index;
-   device_data->vtable.CmdPipelineBarrier(draw->command_buffer,
-                                          VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
-                                          VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
-                                          0,          /* dependency flags */
-                                          0, nullptr, /* memory barriers */
-                                          0, nullptr, /* buffer memory barriers */
-                                          1, &imb);   /* image memory barriers */
+   if (!data->xr) {
+      device_data->vtable.CmdPipelineBarrier(draw->command_buffer,
+                                             VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                                             VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                                             0,          /* dependency flags */
+                                             0, nullptr, /* memory barriers */
+                                             0, nullptr, /* buffer memory barriers */
+                                             1, &imb);   /* image memory barriers */
+   }
 
    device_data->vtable.CmdBeginRenderPass(draw->command_buffer, &render_pass_info,
                                           VK_SUBPASS_CONTENTS_INLINE);
@@ -1034,7 +1051,7 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
 
    device_data->vtable.CmdEndRenderPass(draw->command_buffer);
 
-   if (device_data->graphic_queue->family_index != present_queue->family_index)
+   if (!data->xr && device_data->graphic_queue->family_index != present_queue->family_index)
    {
       /* Transfer the image back to the present queue family
        * image layout was already changed to present by the render pass
@@ -1069,7 +1086,17 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
     * vkQueuePresent, insert our own cross engine synchronization
     * semaphore.
     */
-   if (n_wait_semaphores == 0 && device_data->graphic_queue->queue != present_queue->queue) {
+   if (data->xr) {
+      /* The OpenXR runtime orders its own work after whatever was submitted
+       * to the queue named in the graphics binding, so draw there.
+       */
+      VkSubmitInfo submit_info = {};
+      submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      submit_info.commandBufferCount = 1;
+      submit_info.pCommandBuffers = &draw->command_buffer;
+
+      device_data->vtable.QueueSubmit(present_queue->queue, 1, &submit_info, draw->fence);
+   } else if (n_wait_semaphores == 0 && device_data->graphic_queue->queue != present_queue->queue) {
       VkPipelineStageFlags stages_wait = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
       VkSubmitInfo submit_info = {};
       submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1384,12 +1411,13 @@ static void convert_colors_vk(VkFormat format, VkColorSpaceKHR colorspace, struc
 }
 
 static void setup_swapchain_data(struct swapchain_data *data,
-                                 const VkSwapchainCreateInfoKHR *pCreateInfo)
+                                 uint32_t width, uint32_t height,
+                                 VkFormat format, VkColorSpaceKHR colorspace)
 {
    struct device_data *device_data = data->device;
-   data->width = pCreateInfo->imageExtent.width;
-   data->height = pCreateInfo->imageExtent.height;
-   data->format = pCreateInfo->imageFormat;
+   data->width = width;
+   data->height = height;
+   data->format = format;
 
    if (!data->imgui_contexts.imgui)
       data->imgui_contexts = create_imgui_contexts(data->font_atlas);
@@ -1398,18 +1426,18 @@ static void setup_swapchain_data(struct swapchain_data *data,
 
    ImGui::GetIO().IniFilename = NULL;
    ImGui::GetIO().DisplaySize = ImVec2((float)data->width, (float)data->height);
-   convert_colors_vk(pCreateInfo->imageFormat, pCreateInfo->imageColorSpace, data->sw_stats, device_data->instance->params);
+   convert_colors_vk(format, colorspace, data->sw_stats, device_data->instance->params);
 
    /* Render pass */
    VkAttachmentDescription attachment_desc = {};
-   attachment_desc.format = pCreateInfo->imageFormat;
+   attachment_desc.format = format;
    attachment_desc.samples = VK_SAMPLE_COUNT_1_BIT;
-   attachment_desc.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+   attachment_desc.loadOp = data->xr ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
    attachment_desc.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
    attachment_desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
    attachment_desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
    attachment_desc.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-   attachment_desc.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+   attachment_desc.finalLayout = data->xr ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
    VkAttachmentReference color_attachment = {};
    color_attachment.attachment = 0;
    color_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1438,33 +1466,27 @@ static void setup_swapchain_data(struct swapchain_data *data,
 
    setup_swapchain_data_pipeline(data);
 
-   uint32_t n_images = 0;
-   VK_CHECK(device_data->vtable.GetSwapchainImagesKHR(device_data->device,
-                                                      data->swapchain,
-                                                      &n_images,
-                                                      NULL));
-
-   data->images.resize(n_images);
-   data->image_views.resize(n_images);
-   data->framebuffers.resize(n_images);
-
-   VK_CHECK(device_data->vtable.GetSwapchainImagesKHR(device_data->device,
-                                                      data->swapchain,
-                                                      &n_images,
-                                                      data->images.data()));
-
-
-   if (n_images != data->images.size()) {
+   if (!data->xr) {
+      uint32_t n_images = 0;
+      VK_CHECK(device_data->vtable.GetSwapchainImagesKHR(device_data->device,
+                                                         data->swapchain,
+                                                         &n_images,
+                                                         NULL));
       data->images.resize(n_images);
-      data->image_views.resize(n_images);
-      data->framebuffers.resize(n_images);
+      VK_CHECK(device_data->vtable.GetSwapchainImagesKHR(device_data->device,
+                                                         data->swapchain,
+                                                         &n_images,
+                                                         data->images.data()));
+      data->images.resize(n_images);
    }
+   data->image_views.resize(data->images.size());
+   data->framebuffers.resize(data->images.size());
 
    /* Image views */
    VkImageViewCreateInfo view_info = {};
    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-   view_info.format = pCreateInfo->imageFormat;
+   view_info.format = format;
    view_info.components.r = VK_COMPONENT_SWIZZLE_R;
    view_info.components.g = VK_COMPONENT_SWIZZLE_G;
    view_info.components.b = VK_COMPONENT_SWIZZLE_B;
@@ -1625,38 +1647,9 @@ static bool is_present_mode_supported(VkPhysicalDevice device, VkSurfaceKHR surf
    return false;
 }
 
-static VkResult overlay_CreateSwapchainKHR(
-    VkDevice                                    device,
-    const VkSwapchainCreateInfoKHR*             pCreateInfo,
-    const VkAllocationCallbacks*                pAllocator,
-    VkSwapchainKHR*                             pSwapchain)
+static void fill_swapchain_stats(struct swapchain_data *swapchain_data)
 {
-   VkSwapchainCreateInfoKHR createInfo = *pCreateInfo;
-
-   createInfo.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-
-   struct device_data *device_data = FIND(struct device_data, device);
-   const auto& params = device_data->instance->params;
-
-   std::optional<VkPresentModeKHR> target_present_mode;
-   if (params.m_vulkan_present_mode.has_value()) {
-      target_present_mode = params.m_vulkan_present_mode;
-   }
-
-   if (target_present_mode.has_value()) {
-      if (is_present_mode_supported(device_data->physical_device, createInfo.surface, target_present_mode.value())) {
-         createInfo.presentMode = target_present_mode.value();
-      }
-   }
-
-   HUDElements.cur_present_mode = createInfo.presentMode;
-   SPDLOG_DEBUG("Present mode : {}", string_VkPresentModeKHR(HUDElements.cur_present_mode));
-
-   VkResult result = device_data->vtable.CreateSwapchainKHR(device, &createInfo, pAllocator, pSwapchain);
-   if (result != VK_SUCCESS) return result;
-   struct swapchain_data *swapchain_data = new_swapchain_data(*pSwapchain, device_data);
-   setup_swapchain_data(swapchain_data, pCreateInfo);
-
+   struct device_data *device_data = swapchain_data->device;
    const VkPhysicalDeviceProperties& prop = device_data->properties;
    swapchain_data->sw_stats.version_vk.major = VK_VERSION_MAJOR(prop.apiVersion);
    swapchain_data->sw_stats.version_vk.minor = VK_VERSION_MINOR(prop.apiVersion);
@@ -1694,6 +1687,41 @@ static VkResult overlay_CreateSwapchainKHR(
 #endif
    }
    swapchain_data->sw_stats.driverName = driverProps.driverInfo;
+}
+
+static VkResult overlay_CreateSwapchainKHR(
+    VkDevice                                    device,
+    const VkSwapchainCreateInfoKHR*             pCreateInfo,
+    const VkAllocationCallbacks*                pAllocator,
+    VkSwapchainKHR*                             pSwapchain)
+{
+   VkSwapchainCreateInfoKHR createInfo = *pCreateInfo;
+
+   createInfo.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+   struct device_data *device_data = FIND(struct device_data, device);
+   const auto& params = device_data->instance->params;
+
+   std::optional<VkPresentModeKHR> target_present_mode;
+   if (params.m_vulkan_present_mode.has_value()) {
+      target_present_mode = params.m_vulkan_present_mode;
+   }
+
+   if (target_present_mode.has_value()) {
+      if (is_present_mode_supported(device_data->physical_device, createInfo.surface, target_present_mode.value())) {
+         createInfo.presentMode = target_present_mode.value();
+      }
+   }
+
+   HUDElements.cur_present_mode = createInfo.presentMode;
+   SPDLOG_DEBUG("Present mode : {}", string_VkPresentModeKHR(HUDElements.cur_present_mode));
+
+   VkResult result = device_data->vtable.CreateSwapchainKHR(device, &createInfo, pAllocator, pSwapchain);
+   if (result != VK_SUCCESS) return result;
+   struct swapchain_data *swapchain_data = new_swapchain_data(*pSwapchain, device_data);
+   setup_swapchain_data(swapchain_data, pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
+                        pCreateInfo->imageFormat, pCreateInfo->imageColorSpace);
+   fill_swapchain_stats(swapchain_data);
 
    return result;
 }
@@ -1721,10 +1749,17 @@ static VkResult overlay_QueuePresentKHR(
     VkQueue                                     queue,
     const VkPresentInfoKHR*                     pPresentInfo)
 {
+   struct queue_data *queue_data = FIND(struct queue_data, queue);
+
+   /* With an OpenXR session drawing the HUD, presents only feed the mirror
+    * window: neither their pacing nor their rate says anything about the
+    * headset.
+    */
+   if (xr_target_count.load(std::memory_order_relaxed) > 0)
+      return queue_data->device->vtable.QueuePresentKHR(queue, pPresentInfo);
+
    if (fps_limiter)
       fps_limiter->limit(true);
-
-   struct queue_data *queue_data = FIND(struct queue_data, queue);
 
    VkPresentInfoKHR present_info = *pPresentInfo;
    VkBaseInStructure **mode_info_node = vk_find_next_struct(
@@ -2271,4 +2306,120 @@ extern "C" PUBLIC VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL overlay_GetInstancePr
    struct instance_data *instance_data = FIND(struct instance_data, instance);
    if (instance_data->vtable.GetInstanceProcAddr == NULL) return NULL;
    return instance_data->vtable.GetInstanceProcAddr(instance, funcName);
+}
+
+/* OpenXR HUD targets, see vulkan_xr.h */
+
+struct xr_vk_target {
+   struct swapchain_data *swapchain;
+};
+
+xr_vk_target *xr_vk_target_create(const xr_vk_target_info& info)
+{
+   struct device_data *device_data = FIND(struct device_data, info.device);
+   if (!device_data || !device_data->graphic_queue) {
+      SPDLOG_WARN("OpenXR session uses a VkDevice the Vulkan layer has not seen, not drawing the HUD in the headset");
+      return nullptr;
+   }
+   struct instance_data *instance_data = device_data->instance;
+
+   /* The pipeline and command pool are built for the graphics family, and
+    * a queue family transfer of runtime owned images is not worth it. */
+   if (info.queue_family_index != device_data->graphic_queue->family_index) {
+      SPDLOG_WARN("OpenXR queue family {} differs from the overlay's graphics family {}, not drawing the HUD in the headset",
+                  info.queue_family_index, device_data->graphic_queue->family_index);
+      return nullptr;
+   }
+
+   VkQueue queue = VK_NULL_HANDLE;
+   device_data->vtable.GetDeviceQueue(device_data->device, info.queue_family_index, info.queue_index, &queue);
+   if (!queue) {
+      SPDLOG_ERROR("Failed to retrieve OpenXR queue {} from family {}", info.queue_index, info.queue_family_index);
+      return nullptr;
+   }
+
+   /* Fetch everything that can fail before gating the mirror present path off,
+    * so a failure here leaves the count untouched. */
+   struct queue_data *queue_data = FIND(struct queue_data, queue);
+   std::vector<VkQueueFamilyProperties> family_props;
+   if (!queue_data) {
+      uint32_t n_family_props = 0;
+      instance_data->pd_vtable.GetPhysicalDeviceQueueFamilyProperties(device_data->physical_device,
+                                                                      &n_family_props, NULL);
+      family_props.resize(n_family_props);
+      instance_data->pd_vtable.GetPhysicalDeviceQueueFamilyProperties(device_data->physical_device,
+                                                                      &n_family_props, family_props.data());
+      if (info.queue_family_index >= n_family_props) {
+         SPDLOG_ERROR("OpenXR queue family {} out of range", info.queue_family_index);
+         return nullptr;
+      }
+   }
+
+   /* From here on the mirror present path must not run concurrently: reassigning
+    * graphic_queue and building the imgui context below both touch state it
+    * reads. Gate it off before that, and keep it off until this target is torn
+    * down (xr_vk_target_destroy). */
+   xr_target_count++;
+
+   if (!queue_data) {
+      VK_CHECK(device_data->set_device_loader_data(device_data->device, queue));
+      /* new_queue_data reassigns graphic_queue for any graphics queue; the XR
+       * queue is the graphics family, so save and restore it. */
+      struct queue_data *graphic_queue = device_data->graphic_queue;
+      queue_data = new_queue_data(queue, &family_props[info.queue_family_index],
+                                  info.queue_family_index, device_data);
+      device_data->graphic_queue = graphic_queue;
+      device_data->queues.push_back(queue_data);
+   }
+
+   struct swapchain_data *data = new_swapchain_data(VK_NULL_HANDLE, device_data);
+   data->xr = true;
+   data->xr_queue = queue_data;
+   data->images = info.images;
+   setup_swapchain_data(data, info.width, info.height, info.format, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR);
+   fill_swapchain_stats(data);
+
+   auto *target = new xr_vk_target();
+   target->swapchain = data;
+   return target;
+}
+
+bool xr_vk_target_update(xr_vk_target *target)
+{
+   struct swapchain_data *data = target->swapchain;
+
+   snapshot_swapchain_frame(data);
+   if (data->sw_stats.n_frames == 0 || get_params()->no_display)
+      return false;
+   compute_swapchain_display(data);
+
+   auto saved_imgui_context = get_current_imgui_contexts();
+   make_imgui_contexts_current(data->imgui_contexts);
+   ImDrawData *draw_data = ImGui::GetDrawData();
+   bool has_draws = draw_data && draw_data->TotalVtxCount > 0;
+   make_imgui_contexts_current(saved_imgui_context);
+   return has_draws;
+}
+
+void xr_vk_target_draw(xr_vk_target *target, uint32_t image_index)
+{
+   struct swapchain_data *data = target->swapchain;
+   render_swapchain_display(data, data->xr_queue, nullptr, 0, image_index);
+}
+
+void xr_vk_target_destroy(xr_vk_target *target)
+{
+   struct swapchain_data *data = target->swapchain;
+   struct device_data *device_data = data->device;
+
+   for (auto draw : data->draws) {
+      if (draw)
+         VK_CHECK(device_data->vtable.WaitForFences(device_data->device, 1, &draw->fence, VK_TRUE, ~0ull));
+   }
+   shutdown_swapchain_data(data);
+   destroy_swapchain_data(data);
+   /* The mirror present path may touch graphic_queue and the shared imgui
+    * context again only now that both are gone. */
+   xr_target_count--;
+   delete target;
 }

@@ -1,0 +1,12 @@
+{
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_MANGOHUD_overlay_@cpu_family@",
+        "library_path": "@ld_libdir_mangohud_abs@/libMangoHud.so",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "MangoHud overlay composited into the headset view",
+        "enable_environment": "MANGOHUD",
+        "disable_environment": "DISABLE_MANGOHUD"
+    }
+}

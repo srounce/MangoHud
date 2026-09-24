@@ -4,6 +4,7 @@
     overlay_GetInstanceProcAddr;
     overlay_GetDeviceProcAddr;
     vkNegotiateLoaderLayerInterfaceVersion;
+    xrNegotiateLoaderApiLayerInterface;
     glX*;
     egl*;
     dlsym;

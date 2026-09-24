@@ -193,6 +193,12 @@ vulkan_dep = declare_dependency(
 )
 meson.override_dependency('vulkan', vulkan_dep)
 
+# Headers only: the layer is loaded by the OpenXR loader and never calls it.
+openxr_dep = null_dep
+if is_unixy
+  openxr_dep = dependency('openxr', required: get_option('with_openxr'))
+endif
+
   vulkan_utility_libraries_sp = subproject('vulkan-utility-libraries')
   dep_vulkan_utility_libraries = vulkan_utility_libraries_sp.get_variable('vulkan_utility_libraries_dep')
 # else

@@ -225,6 +225,11 @@ struct Tracepoint;
    OVERLAY_PARAM_CUSTOM(gpu_list)                    \
    OVERLAY_PARAM_CUSTOM(fex_stats)                   \
    OVERLAY_PARAM_CUSTOM(ftrace)                      \
+   OVERLAY_PARAM_CUSTOM(vr_distance)                 \
+   OVERLAY_PARAM_CUSTOM(vr_size)                     \
+   OVERLAY_PARAM_CUSTOM(vr_offset_x)                 \
+   OVERLAY_PARAM_CUSTOM(vr_offset_y)                 \
+   OVERLAY_PARAM_CUSTOM(vr_resolution)               \
 
 enum overlay_param_position {
    LAYER_POSITION_TOP_LEFT,
@@ -357,6 +362,8 @@ struct overlay_params {
    unsigned short fcat_screen_edge;
    unsigned short fcat_overlay_width;
    int picmip;
+   float vr_distance, vr_size, vr_offset_x, vr_offset_y;
+   unsigned vr_resolution;
    int af;
    std::vector<int> preset;
    size_t font_params_hash;
@@ -409,5 +416,6 @@ extern std::mutex config_mtx;
 extern std::condition_variable config_cv;
 extern bool config_ready;
 std::shared_ptr<overlay_params> get_params();
+std::shared_ptr<overlay_params> get_params_nonblocking();
 
 #endif /* MANGOHUD_OVERLAY_PARAMS_H */

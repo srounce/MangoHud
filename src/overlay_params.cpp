@@ -614,6 +614,11 @@ parse_ftrace(const char *str) {
 #define parse_fcat_screen_edge(s) parse_unsigned(s)
 #define parse_picmip(s) parse_signed(s)
 #define parse_af(s) parse_signed(s)
+#define parse_vr_distance(s) parse_float(s)
+#define parse_vr_size(s) parse_float(s)
+#define parse_vr_offset_x(s) parse_float(s)
+#define parse_vr_offset_y(s) parse_float(s)
+#define parse_vr_resolution(s) parse_unsigned(s)
 
 #define parse_cpu_color(s) parse_color(s)
 #define parse_gpu_color(s) parse_color(s)
@@ -898,6 +903,11 @@ static void set_param_defaults(struct overlay_params *params){
    params->fcat_overlay_width = 24;
    params->time_format = "%T";
    params->gpu_color = 0x2e9762;
+   params->vr_distance = 1.0f;
+   params->vr_size = 0.8f;
+   params->vr_offset_x = 0.0f;
+   params->vr_offset_y = 0.0f;
+   params->vr_resolution = 1024;
    params->cpu_color = 0x2e97cb;
    params->vram_color = 0xad64c1;
    params->ram_color = 0xc26693;
@@ -1243,6 +1253,13 @@ std::shared_ptr<overlay_params> get_params() {
         if (p) return p;
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
+}
+
+/* Returns null instead of blocking when the config is not parsed yet. For
+ * callers on a thread that must not stall, like the OpenXR frame loop, which
+ * runs before the Vulkan layer has necessarily set the config. */
+std::shared_ptr<overlay_params> get_params_nonblocking() {
+    return g_params.load(std::memory_order_acquire);
 }
 
 bool parse_preset_config(int preset, struct overlay_params *params){
