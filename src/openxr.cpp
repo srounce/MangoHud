@@ -241,7 +241,7 @@ bool init_session_overlay(xr_session_data *sd, const overlay_params& params)
    if (!sd->target)
       return false;
 
-   SPDLOG_DEBUG("OpenXR headset HUD initialised");
+   SPDLOG_INFO("OpenXR headset HUD initialised");
    return true;
 }
 
@@ -362,7 +362,7 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrCreateSession(XrInstance instance, cons
                   "different libMangoHud.so files); not drawing the HUD in the headset");
       sd->vulkan = false;
    } else {
-      SPDLOG_DEBUG("OpenXR Vulkan session created: VkDevice {} queue family {} index {}",
+      SPDLOG_INFO("OpenXR Vulkan session created: VkDevice {} queue family {} index {}",
                    (void *)sd->binding.device, sd->binding.queueFamilyIndex, sd->binding.queueIndex);
    }
 
@@ -526,6 +526,6 @@ xrNegotiateLoaderApiLayerInterface(const XrNegotiateLoaderInfo *loaderInfo,
    apiLayerRequest->layerApiVersion = XR_CURRENT_API_VERSION;
    apiLayerRequest->getInstanceProcAddr = overlay_xrGetInstanceProcAddr;
    apiLayerRequest->createApiLayerInstance = overlay_xrCreateApiLayerInstance;
-   SPDLOG_DEBUG("MangoHud OpenXR layer loaded, negotiation succeeded");
+   SPDLOG_INFO("MangoHud OpenXR layer loaded, negotiation succeeded");
    return XR_SUCCESS;
 }
