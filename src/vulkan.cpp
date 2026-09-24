@@ -2407,6 +2407,17 @@ void xr_vk_target_draw(xr_vk_target *target, uint32_t image_index)
    render_swapchain_display(data, data->xr_queue, nullptr, 0, image_index);
 }
 
+void xr_vk_target_content_extent(xr_vk_target *target, uint32_t& width, uint32_t& height)
+{
+   struct swapchain_data *data = target->swapchain;
+   /* main_window_pos is the HUD's top-left; mirror that gap on the far side so
+    * the content sits centered in the cropped region. */
+   float w = data->sw_stats.main_window_pos.x * 2.0f + data->window_size.x;
+   float h = data->sw_stats.main_window_pos.y * 2.0f + data->window_size.y;
+   width = std::min(data->width, (uint32_t)std::max(w + 0.5f, 1.0f));
+   height = std::min(data->height, (uint32_t)std::max(h + 0.5f, 1.0f));
+}
+
 void xr_vk_target_destroy(xr_vk_target *target)
 {
    struct swapchain_data *data = target->swapchain;

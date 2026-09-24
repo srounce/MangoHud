@@ -168,7 +168,11 @@ bool init_session_overlay(xr_session_data *sd, const overlay_params& params)
       return false;
    }
 
-   sd->width = sd->height = std::max(params.vr_resolution, 64u);
+   /* HUDs are tall and narrow, so give the canvas vertical headroom; the quad
+    * is cropped to the content each frame, so the extra height is free. */
+   uint32_t res = std::max(params.vr_resolution, 64u);
+   sd->width = res;
+   sd->height = res * 2;
    XrSwapchainCreateInfo swapchain_info { XR_TYPE_SWAPCHAIN_CREATE_INFO };
    swapchain_info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
    swapchain_info.format = sd->format;
@@ -299,12 +303,15 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFra
    quad.space = sd->space;
    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
    quad.subImage.swapchain = sd->swapchain;
+   /* Show only the region the HUD covered, sized so its aspect is preserved. */
+   uint32_t content_w = sd->width, content_h = sd->height;
+   xr_vk_target_content_extent(sd->target, content_w, content_h);
    quad.subImage.imageRect.offset = { 0, 0 };
-   quad.subImage.imageRect.extent = { (int32_t)sd->width, (int32_t)sd->height };
+   quad.subImage.imageRect.extent = { (int32_t)content_w, (int32_t)content_h };
    quad.subImage.imageArrayIndex = 0;
    quad.pose.orientation = { 0.f, 0.f, 0.f, 1.f };
    quad.pose.position = { params->vr_offset_x, params->vr_offset_y, -params->vr_distance };
-   quad.size = { params->vr_size, params->vr_size * (float)sd->height / (float)sd->width };
+   quad.size = { params->vr_size, params->vr_size * (float)content_h / (float)content_w };
 
    std::vector<const XrCompositionLayerBaseHeader *> layers(frameEndInfo->layers,
                                                             frameEndInfo->layers + frameEndInfo->layerCount);
