@@ -217,9 +217,9 @@ std::unordered_map<uint64_t, void *> vk_object_to_data;
 static std::mutex overlay_lock;
 
 /* Last time the OpenXR frame loop ran an update. While it is recent the
- * headset loop owns frame timing and keybinds and the mirror present path
- * passes through; once frames stop (session idle, headset off) the mirror
- * resumes so stats and keybinds keep working. */
+ * headset loop owns the fps limiter; the mirror present keeps its own stats
+ * and HUD. Once frames stop (session idle, headset off) the limiter returns
+ * to the mirror. */
 static std::atomic<uint64_t> xr_last_frame_ns {0};
 static const uint64_t XR_IDLE_NS = 500ull * 1000 * 1000;
 
@@ -1799,19 +1799,14 @@ static VkResult overlay_QueuePresentKHR(
 {
    struct queue_data *queue_data = FIND(struct queue_data, queue);
 
-   /* While the OpenXR frame loop is running, presents only feed the mirror
-    * window: neither their pacing nor their rate says anything about the
-    * headset, and that loop already services stats, keybinds and the fps
-    * limiter. Once it goes quiet (session idle, headset off) the mirror takes
-    * over again.
+   /* While the OpenXR frame loop is running, fps_limit is applied around
+    * xrEndFrame; pacing the mirror present as well would throttle the game
+    * twice. Once it goes quiet (session idle, headset off) the mirror takes
+    * the limiter back.
     */
    std::unique_lock<std::mutex> overlay_lk(overlay_lock);
-   if (xr_hud_active()) {
-      overlay_lk.unlock();
-      return queue_data->device->vtable.QueuePresentKHR(queue, pPresentInfo);
-   }
-
-   if (fps_limiter)
+   bool limit_here = fps_limiter && !xr_hud_active();
+   if (limit_here)
       fps_limiter->limit(true);
 
    VkPresentInfoKHR present_info = *pPresentInfo;
@@ -1862,7 +1857,7 @@ static VkResult overlay_QueuePresentKHR(
    overlay_lk.unlock();
    VkResult result = queue_data->device->vtable.QueuePresentKHR(queue, &present_info);
 
-   if (fps_limiter)
+   if (limit_here)
       fps_limiter->limit(false);
 
    return result;
@@ -2448,9 +2443,8 @@ bool xr_vk_target_update(xr_vk_target *target)
    struct swapchain_data *data = target->swapchain;
    std::lock_guard<std::mutex> lk(overlay_lock);
 
-   /* Marks the headset loop as live so the mirror path yields stats, keybinds
-    * and the fps limiter to it; runs even when the HUD is hidden, since the
-    * keybind to unhide it is serviced from here. */
+   /* Marks the headset loop as live so the mirror path yields the fps limiter
+    * to it; runs even when the HUD is hidden. */
    xr_last_frame_ns.store(os_time_get_nano(), std::memory_order_relaxed);
 
    snapshot_swapchain_frame(data);

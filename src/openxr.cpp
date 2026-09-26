@@ -104,8 +104,8 @@ bool mangohud_enabled()
    return enabled;
 }
 
-/* fps_limit is normally applied around the mirror present, which is passed
- * through while the headset loop runs; apply it here instead. */
+/* fps_limit is normally applied around the mirror present, which yields the
+ * limiter while the headset loop runs; apply it here instead. */
 XrResult end_frame_limited(xr_instance_data *inst, XrSession session, const XrFrameEndInfo *info)
 {
    if (fps_limiter)
