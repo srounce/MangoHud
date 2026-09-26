@@ -2,6 +2,7 @@
 #ifndef MANGOHUD_OVERLAY_H
 #define MANGOHUD_OVERLAY_H
 
+#include <atomic>
 #include <string>
 #include <stdint.h>
 #include <vector>
@@ -137,6 +138,22 @@ inline const char* engine_name(const swapchain_stats& sw_stats) {
 
    return en[OVERLAY_PARAM_ENABLED_engine_short_names] ? engines_short[engine] : engines[engine];
 }
+
+/* Headset frame timing published by the OpenXR layer for the vr_stats
+ * element. last_frame_ns is 0 or stale while no headset frame loop runs. */
+struct xr_frame_stats {
+   std::atomic<uint64_t> last_frame_ns {0};
+   std::atomic<float> fps {0.f};
+   std::atomic<float> frametime_ms {0.f};
+   /* xrWaitFrame return to xrEndFrame call. */
+   std::atomic<float> app_cpu_ms {0.f};
+   /* XrFrameState::predictedDisplayPeriod. */
+   std::atomic<float> display_period_ms {0.f};
+   /* Frames the runtime skipped: predictedDisplayTime advanced by more than
+    * one period between consecutive xrWaitFrame calls. */
+   std::atomic<uint64_t> dropped {0};
+};
+extern xr_frame_stats xr_stats;
 
 extern uint32_t deviceID;
 

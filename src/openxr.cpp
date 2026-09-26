@@ -1,8 +1,8 @@
-/* OpenXR API layer: measures frame timing at xrEndFrame instead of at the
- * mirror window's present and composites the HUD into the headset view as a
- * head-locked quad layer. Only Vulkan sessions that reach
- * XR_SESSION_STATE_FOCUSED are acted on; other sessions pass through
- * untouched. */
+/* OpenXR API layer: measures the headset frame loop (rate at xrEndFrame, app
+ * CPU time from xrWaitFrame to xrEndFrame, runtime display period and skipped
+ * display times) and composites the HUD into the headset view as a quad
+ * layer. Only Vulkan sessions that reach XR_SESSION_STATE_FOCUSED are acted
+ * on; other sessions pass through untouched. */
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +20,7 @@
 #include <openxr/openxr_loader_negotiation.h>
 
 #include "mesa/util/macros.h"
+#include "mesa/util/os_time.h"
 #include "overlay.h"
 #include "blacklist.h"
 #include "fps_limiter.h"
@@ -42,6 +43,7 @@ struct xr_instance_data {
    PFN_xrCreateSession CreateSession = nullptr;
    PFN_xrDestroySession DestroySession = nullptr;
    PFN_xrPollEvent PollEvent = nullptr;
+   PFN_xrWaitFrame WaitFrame = nullptr;
    PFN_xrEndFrame EndFrame = nullptr;
    PFN_xrCreateSwapchain CreateSwapchain = nullptr;
    PFN_xrDestroySwapchain DestroySwapchain = nullptr;
@@ -71,6 +73,21 @@ struct xr_session_data {
    /* Set once the session reaches FOCUSED and kept: the helper sessions
     * wineopenxr and Steam spin up never get there, so they stay untouched. */
    std::atomic<bool> focused {false};
+
+   /* Frame timing accumulated between publishes. xrWaitFrame and xrEndFrame
+    * may run on different threads. */
+   std::mutex timing_lock;
+   uint64_t wait_return_ns = 0;
+   /* The xrEndFrame that sets up the HUD is slow enough to miss a display
+    * time; that miss is the layer's, not the app's. */
+   bool ignore_next_gap = false;
+   XrTime last_display_time = 0;
+   XrDuration display_period = 0;
+   uint64_t dropped = 0;
+   uint64_t window_start_ns = 0;
+   uint64_t window_frames = 0;
+   uint64_t window_cpu_ns = 0;
+   uint64_t window_cpu_frames = 0;
 };
 
 std::mutex xr_lock;
@@ -137,6 +154,8 @@ void load_next(xr_instance_data *data, const char *name, T& fn)
 void destroy_session_overlay(xr_session_data *sd)
 {
    xr_instance_data *inst = sd->instance;
+   if (sd->focused)
+      xr_stats.last_frame_ns.store(0, std::memory_order_relaxed);
    if (sd->target) {
       xr_vk_target_destroy(sd->target);
       sd->target = nullptr;
@@ -271,6 +290,74 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrPollEvent(XrInstance instance, XrEventD
    return result;
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL overlay_xrWaitFrame(XrSession session, const XrFrameWaitInfo *frameWaitInfo,
+                                                   XrFrameState *frameState)
+{
+   xr_session_data *sd = find_session(session);
+   if (!sd)
+      return XR_ERROR_HANDLE_INVALID;
+
+   XrResult result = sd->instance->WaitFrame(session, frameWaitInfo, frameState);
+   if (XR_FAILED(result) || !frameState || !sd->focused)
+      return result;
+
+   std::lock_guard<std::mutex> lk(sd->timing_lock);
+   sd->wait_return_ns = os_time_get_nano();
+   /* The runtime hands out one predicted display time per compositor frame;
+    * a jump of more than one period means it went by without this app's
+    * frame, whatever the reason (late submit, throttling, reprojection). */
+   if (frameState->predictedDisplayPeriod > 0) {
+      sd->display_period = frameState->predictedDisplayPeriod;
+      if (sd->last_display_time && frameState->predictedDisplayTime > sd->last_display_time && !sd->ignore_next_gap) {
+         XrDuration gap = frameState->predictedDisplayTime - sd->last_display_time;
+         int64_t periods = (gap + sd->display_period / 2) / sd->display_period;
+         if (periods > 1)
+            sd->dropped += periods - 1;
+      }
+   }
+   sd->ignore_next_gap = false;
+   sd->last_display_time = frameState->predictedDisplayTime;
+   return result;
+}
+
+/* Counts this xrEndFrame and, once per fps_sampling_period, publishes the
+ * window's averages for the HUD. */
+void record_end_frame(xr_session_data *sd, const overlay_params& params)
+{
+   uint64_t now = os_time_get_nano();
+   std::lock_guard<std::mutex> lk(sd->timing_lock);
+
+   if (sd->wait_return_ns) {
+      sd->window_cpu_ns += now - sd->wait_return_ns;
+      sd->window_cpu_frames++;
+      sd->wait_return_ns = 0;
+   }
+   sd->window_frames++;
+   xr_stats.last_frame_ns.store(now, std::memory_order_relaxed);
+
+   if (!sd->window_start_ns) {
+      sd->window_start_ns = now;
+      return;
+   }
+   uint64_t elapsed = now - sd->window_start_ns;
+   if (elapsed < params.fps_sampling_period)
+      return;
+
+   xr_stats.fps.store(1e9f * sd->window_frames / elapsed, std::memory_order_relaxed);
+   xr_stats.frametime_ms.store(elapsed / 1e6f / sd->window_frames, std::memory_order_relaxed);
+   if (sd->window_cpu_frames)
+      xr_stats.app_cpu_ms.store(sd->window_cpu_ns / 1e6f / sd->window_cpu_frames, std::memory_order_relaxed);
+   xr_stats.display_period_ms.store(sd->display_period / 1e6f, std::memory_order_relaxed);
+   xr_stats.dropped.store(sd->dropped, std::memory_order_relaxed);
+   SPDLOG_DEBUG("OpenXR frame loop: {:.1f} fps, app cpu {:.2f} ms, period {:.2f} ms, dropped {}",
+                xr_stats.fps.load(), xr_stats.app_cpu_ms.load(), xr_stats.display_period_ms.load(), sd->dropped);
+
+   sd->window_start_ns = now;
+   sd->window_frames = 0;
+   sd->window_cpu_ns = 0;
+   sd->window_cpu_frames = 0;
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 {
    xr_session_data *sd = find_session(session);
@@ -296,7 +383,12 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFra
          sd->init_failed = true;
          return inst->EndFrame(session, frameEndInfo);
       }
+      std::lock_guard<std::mutex> lk(sd->timing_lock);
+      sd->ignore_next_gap = true;
    }
+
+   if (auto params = get_params_nonblocking())
+      record_end_frame(sd, *params);
 
    if (!xr_vk_target_update(sd->target))
       return end_frame_limited(inst, session, frameEndInfo);
@@ -478,6 +570,7 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrCreateApiLayerInstance(const XrInstance
    load_next(inst, "xrCreateSession", inst->CreateSession);
    load_next(inst, "xrDestroySession", inst->DestroySession);
    load_next(inst, "xrPollEvent", inst->PollEvent);
+   load_next(inst, "xrWaitFrame", inst->WaitFrame);
    load_next(inst, "xrEndFrame", inst->EndFrame);
    load_next(inst, "xrCreateSwapchain", inst->CreateSwapchain);
    load_next(inst, "xrDestroySwapchain", inst->DestroySwapchain);
@@ -506,6 +599,7 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrGetInstanceProcAddr(XrInstance instance
       { "xrCreateSession", reinterpret_cast<PFN_xrVoidFunction>(overlay_xrCreateSession), false },
       { "xrDestroySession", reinterpret_cast<PFN_xrVoidFunction>(overlay_xrDestroySession), false },
       { "xrPollEvent", reinterpret_cast<PFN_xrVoidFunction>(overlay_xrPollEvent), false },
+      { "xrWaitFrame", reinterpret_cast<PFN_xrVoidFunction>(overlay_xrWaitFrame), false },
       { "xrEndFrame", reinterpret_cast<PFN_xrVoidFunction>(overlay_xrEndFrame), false },
    };
 
