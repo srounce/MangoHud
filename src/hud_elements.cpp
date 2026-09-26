@@ -15,6 +15,7 @@
 #include "memory.h"
 #include "iostats.h"
 #include "mesa/util/macros.h"
+#include "mesa/util/os_time.h"
 #include "string_utils.h"
 #include "app/mangoapp.h"
 #include <IconsForkAwesome.h>
@@ -1459,6 +1460,74 @@ void HudElements::frame_count(){
     }
 }
 
+/* Drawn only while the OpenXR layer runs a headset frame loop. On the headset
+ * the FPS row is already the VR rate, so the extra rate row is the mirror
+ * window's present; on the mirror window it is the VR rate. */
+void HudElements::vr_stats(){
+    if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_vr_stats])
+        return;
+    const uint64_t stale_ns = 1000000000ull;
+    uint64_t now = os_time_get_nano();
+    uint64_t last = xr_stats.last_frame_ns.load(std::memory_order_relaxed);
+    if (!last || now - last > stale_ns)
+        return;
+
+    auto unit = [](const char *text) {
+        ImGui::SameLine(0, 1.0f);
+        ImGui::PushFont(HUDElements.sw_stats->font_small);
+        HUDElements.TextColored(HUDElements.colors.text, "%s", text);
+        ImGui::PopFont();
+    };
+    auto label = [](const char *text) {
+        ImguiNextColumnFirstItem();
+        HUDElements.TextColored(HUDElements.colors.engine, "%s", text);
+        ImguiNextColumnOrNewRow();
+    };
+
+    const char *rate_label = nullptr;
+    float fps = 0.f, frametime = 0.f;
+    if (HUDElements.sw_stats->engine == OPENXR) {
+        uint64_t present = present_stats.last_ns.load(std::memory_order_relaxed);
+        if (present && now - present < stale_ns) {
+            rate_label = engine_name((enum EngineTypes)present_stats.engine.load(std::memory_order_relaxed),
+                                     present_stats.applicationVersion.load(std::memory_order_relaxed));
+            fps = present_stats.fps.load(std::memory_order_relaxed);
+            frametime = fps > 0.f ? 1000.f / fps : 0.f;
+        }
+    } else {
+        rate_label = engine_name(OPENXR);
+        fps = xr_stats.fps.load(std::memory_order_relaxed);
+        frametime = xr_stats.frametime_ms.load(std::memory_order_relaxed);
+    }
+    if (rate_label) {
+        label(rate_label);
+        right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.0f", fps);
+        unit("FPS");
+        ImguiNextColumnOrNewRow();
+        right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.1f", frametime);
+        unit("ms");
+    }
+
+    label("VR CPU");
+    right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.1f",
+                       xr_stats.app_cpu_ms.load(std::memory_order_relaxed));
+    unit("ms");
+
+    float period = xr_stats.display_period_ms.load(std::memory_order_relaxed);
+    label("VR Period");
+    right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.1f", period);
+    unit("ms");
+    if (period > 0.f) {
+        ImguiNextColumnOrNewRow();
+        right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.0f", 1000.f / period);
+        unit("Hz");
+    }
+
+    label("VR Dropped");
+    right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%" PRIu64,
+                       xr_stats.dropped.load(std::memory_order_relaxed));
+}
+
 void HudElements::fan(){
     if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_fan] && fan_speed != -1) {
         ImguiNextColumnFirstItem();
@@ -1983,6 +2052,7 @@ void HudElements::sort_elements(const std::pair<std::string, std::string>& optio
         {"fps", {fps}},
         {"gpu_name", {gpu_name}},
         {"frame_timing", {frame_timing}},
+        {"vr_stats", {vr_stats}},
         {"media_player", {media_player}},
         {"custom_text", {custom_text}},
         {"custom_text_center", {custom_text_center}},
@@ -2107,6 +2177,8 @@ void HudElements::legacy_elements(const overlay_params* temp_params){
         ordered_functions.push_back({wine, "wine", value});
     if (temp_params->enabled[OVERLAY_PARAM_ENABLED_frame_timing])
         ordered_functions.push_back({frame_timing, "frame_timing", value});
+    if (temp_params->enabled[OVERLAY_PARAM_ENABLED_vr_stats])
+        ordered_functions.push_back({vr_stats, "vr_stats", value});
     if (temp_params->enabled[OVERLAY_PARAM_ENABLED_frame_count])
         ordered_functions.push_back({frame_count, "frame_count", value});
     if (temp_params->enabled[OVERLAY_PARAM_ENABLED_debug] && !temp_params->enabled[OVERLAY_PARAM_ENABLED_horizontal])

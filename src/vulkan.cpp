@@ -1841,6 +1841,11 @@ static VkResult overlay_QueuePresentKHR(
                                                  pPresentInfo->waitSemaphoreCount,
                                                  pPresentInfo->pImageIndices[0]);
 
+      present_stats.fps.store(swapchain_data->sw_stats.fps, std::memory_order_relaxed);
+      present_stats.engine.store(swapchain_data->sw_stats.engine, std::memory_order_relaxed);
+      present_stats.applicationVersion.store(swapchain_data->sw_stats.applicationVersion, std::memory_order_relaxed);
+      present_stats.last_ns.store(os_time_get_nano(), std::memory_order_relaxed);
+
       /* Because the submission of the overlay draw waits on the semaphores
        * handed for present, we don't need to have this present operation
        * wait on them as well, we can just wait on the overlay submission
@@ -2432,6 +2437,9 @@ xr_vk_target *xr_vk_target_create(const xr_vk_target_info& info)
    data->images = info.images;
    setup_swapchain_data(data, info.width, info.height, info.format, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR);
    fill_swapchain_stats(data);
+   /* This HUD's FPS row counts xrEndFrame calls, not the game engine's
+    * presents, so label it as such; vr_stats keys off it too. */
+   data->sw_stats.engine = OPENXR;
 
    auto *target = new xr_vk_target();
    target->swapchain = data;

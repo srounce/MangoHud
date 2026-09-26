@@ -50,6 +50,7 @@ bool gpu_metrics_exists = false;
 bool steam_focused = false;
 vector<float> frametime_data(200,0.f);
 xr_frame_stats xr_stats;
+vk_present_stats present_stats;
 int fan_speed;
 fcatoverlay fcatstatus;
 std::string drm_dev;

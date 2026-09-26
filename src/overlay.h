@@ -38,7 +38,8 @@ enum EngineTypes
    TOGL,
 
    GAMESCOPE,
-   SDL
+   SDL,
+   OPENXR
 };
 
 struct swapchain_stats {
@@ -93,17 +94,16 @@ struct LOAD_DATA {
 };
 
 
-inline const char* engine_name(const swapchain_stats& sw_stats) {
+inline const char* engine_name(enum EngineTypes engine, uint32_t applicationVersion = UINT32_MAX) {
    const char* engines[] = {
       "Unknown", "OpenGL", "VULKAN", "DXVK", "VKD3D", "DAMAVAND",
-      "ZINK", "WINED3D", "Feral3D", "ToGL", "GAMESCOPE", "SDL"
+      "ZINK", "WINED3D", "Feral3D", "ToGL", "GAMESCOPE", "SDL", "OPENXR"
    };
    const char* engines_short[] = {
       "Unknown", "OGL", "VK", "DXVK", "VKD3D", "DV",
-       "ZINK", "WD3D", "Feral3D", "ToGL", "GS", "SDL"
+       "ZINK", "WD3D", "Feral3D", "ToGL", "GS", "SDL", "XR"
    };
 
-   auto engine = sw_stats.engine;
    auto params = get_params();
    if (!params)
       return "Unknown";
@@ -126,10 +126,10 @@ inline const char* engine_name(const swapchain_stats& sw_stats) {
          return "DX12";
 
       if (engine == EngineTypes::DXVK) {
-         if (sw_stats.applicationVersion == 0)
+         if (applicationVersion == 0)
             return "DX10,11";
 
-         if (sw_stats.applicationVersion == 1)
+         if (applicationVersion == 1)
             return "DX3-9";
 
          return "DX?";
@@ -137,6 +137,10 @@ inline const char* engine_name(const swapchain_stats& sw_stats) {
    }
 
    return en[OVERLAY_PARAM_ENABLED_engine_short_names] ? engines_short[engine] : engines[engine];
+}
+
+inline const char* engine_name(const swapchain_stats& sw_stats) {
+   return engine_name(sw_stats.engine, sw_stats.applicationVersion);
 }
 
 /* Headset frame timing published by the OpenXR layer for the vr_stats
@@ -154,6 +158,16 @@ struct xr_frame_stats {
    std::atomic<uint64_t> dropped {0};
 };
 extern xr_frame_stats xr_stats;
+
+/* Rate of the flat window's vkQueuePresentKHR, so the headset HUD can show
+ * the mirror rate next to its own. */
+struct vk_present_stats {
+   std::atomic<uint64_t> last_ns {0};
+   std::atomic<float> fps {0.f};
+   std::atomic<int> engine {EngineTypes::UNKNOWN};
+   std::atomic<uint32_t> applicationVersion {UINT32_MAX};
+};
+extern vk_present_stats present_stats;
 
 extern uint32_t deviceID;
 

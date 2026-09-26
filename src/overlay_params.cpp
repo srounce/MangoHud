@@ -852,6 +852,7 @@ parse_overlay_env(struct overlay_params *params,
 static void set_param_defaults(struct overlay_params *params){
    params->enabled[OVERLAY_PARAM_ENABLED_fps] = true;
    params->enabled[OVERLAY_PARAM_ENABLED_frame_timing] = true;
+   params->enabled[OVERLAY_PARAM_ENABLED_vr_stats] = true;
    params->enabled[OVERLAY_PARAM_ENABLED_core_load] = false;
    params->enabled[OVERLAY_PARAM_ENABLED_core_bars] = false;
    params->enabled[OVERLAY_PARAM_ENABLED_cpu_temp] = false;

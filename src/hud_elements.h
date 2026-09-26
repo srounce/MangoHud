@@ -90,6 +90,7 @@ class HudElements{
         static void arch();
         static void wine();
         static void frame_timing();
+        static void vr_stats();
         static void media_player();
         static void resolution();
         static void show_fps_limit();
