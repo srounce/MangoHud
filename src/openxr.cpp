@@ -1,9 +1,11 @@
 /* OpenXR API layer: measures frame timing at xrEndFrame instead of at the
  * mirror window's present and composites the HUD into the headset view as a
- * head-locked quad layer. Only Vulkan sessions are drawn; other sessions pass
- * through untouched. */
+ * head-locked quad layer. Only Vulkan sessions that reach
+ * XR_SESSION_STATE_FOCUSED are acted on; other sessions pass through
+ * untouched. */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -39,6 +41,7 @@ struct xr_instance_data {
    PFN_xrDestroyInstance DestroyInstance = nullptr;
    PFN_xrCreateSession CreateSession = nullptr;
    PFN_xrDestroySession DestroySession = nullptr;
+   PFN_xrPollEvent PollEvent = nullptr;
    PFN_xrEndFrame EndFrame = nullptr;
    PFN_xrCreateSwapchain CreateSwapchain = nullptr;
    PFN_xrDestroySwapchain DestroySwapchain = nullptr;
@@ -64,6 +67,10 @@ struct xr_session_data {
    uint32_t width = 0, height = 0;
    xr_vk_target *target = nullptr;
    bool announced = false;
+
+   /* Set once the session reaches FOCUSED and kept: the helper sessions
+    * wineopenxr and Steam spin up never get there, so they stay untouched. */
+   std::atomic<bool> focused {false};
 };
 
 std::mutex xr_lock;
@@ -245,6 +252,25 @@ bool init_session_overlay(xr_session_data *sd, const overlay_params& params)
    return true;
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL overlay_xrPollEvent(XrInstance instance, XrEventDataBuffer *eventData)
+{
+   xr_instance_data *inst = find_instance(instance);
+   if (!inst)
+      return XR_ERROR_HANDLE_INVALID;
+
+   XrResult result = inst->PollEvent(instance, eventData);
+   if (result != XR_SUCCESS || !eventData || eventData->type != XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
+      return result;
+
+   auto *changed = reinterpret_cast<const XrEventDataSessionStateChanged *>(eventData);
+   if (changed->state != XR_SESSION_STATE_FOCUSED)
+      return result;
+   xr_session_data *sd = find_session(changed->session);
+   if (sd && sd->vulkan && !sd->focused.exchange(true))
+      SPDLOG_INFO("OpenXR session focused, measuring its frame loop and drawing the HUD in the headset");
+   return result;
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 {
    xr_session_data *sd = find_session(session);
@@ -252,7 +278,7 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrEndFrame(XrSession session, const XrFra
       return XR_ERROR_HANDLE_INVALID;
    xr_instance_data *inst = sd->instance;
 
-   if (!sd->vulkan || sd->init_failed || !frameEndInfo)
+   if (!sd->vulkan || sd->init_failed || !frameEndInfo || !sd->focused)
       return inst->EndFrame(session, frameEndInfo);
 
    if (!sd->target) {
@@ -451,6 +477,7 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrCreateApiLayerInstance(const XrInstance
    load_next(inst, "xrDestroyInstance", inst->DestroyInstance);
    load_next(inst, "xrCreateSession", inst->CreateSession);
    load_next(inst, "xrDestroySession", inst->DestroySession);
+   load_next(inst, "xrPollEvent", inst->PollEvent);
    load_next(inst, "xrEndFrame", inst->EndFrame);
    load_next(inst, "xrCreateSwapchain", inst->CreateSwapchain);
    load_next(inst, "xrDestroySwapchain", inst->DestroySwapchain);
@@ -478,6 +505,7 @@ XRAPI_ATTR XrResult XRAPI_CALL overlay_xrGetInstanceProcAddr(XrInstance instance
       { "xrDestroyInstance", reinterpret_cast<PFN_xrVoidFunction>(overlay_xrDestroyInstance), true },
       { "xrCreateSession", reinterpret_cast<PFN_xrVoidFunction>(overlay_xrCreateSession), false },
       { "xrDestroySession", reinterpret_cast<PFN_xrVoidFunction>(overlay_xrDestroySession), false },
+      { "xrPollEvent", reinterpret_cast<PFN_xrVoidFunction>(overlay_xrPollEvent), false },
       { "xrEndFrame", reinterpret_cast<PFN_xrVoidFunction>(overlay_xrEndFrame), false },
    };
 
